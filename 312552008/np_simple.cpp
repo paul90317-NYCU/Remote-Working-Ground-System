@@ -2,12 +2,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <iostream>
 #include <queue>
 #include <unordered_map>
 #include <vector>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 using namespace std;
 
@@ -137,8 +139,9 @@ void exec(vector<char *> &argv)
     exit(EXIT_FAILURE);
 }
 
-int current_line = -1;
+int current_line;
 unordered_map<int, pii> numbered_pipes;
+bool client_exit;
 void single_cmd(char *cmd)
 {
     if (!*cmd)
@@ -175,8 +178,10 @@ void single_cmd(char *cmd)
 
         if (!argv[0])
             return;
-        if (!strcmp(argv[0], "exit"))
-            exit(EXIT_SUCCESS);
+        if (!strcmp(argv[0], "exit")){
+            client_exit = true;
+            return;
+        }
         if (!strcmp(argv[0], "printenv")) {
             if (argv.size() != 3) {
                 fprintf(stderr, "Usage: printenv [var].\n");
@@ -201,14 +206,87 @@ void single_cmd(char *cmd)
     }
 }
 
-int main()
+int TCP_server(int port)
 {
-    string cmd;
-    printf("%% ");
-    setenv("PATH", "bin:.", true);
-    while (getline(cin, cmd)) {
-        single_cmd(&cmd[0]);
-        printf("%% ");
+    int server_fd;
+    struct sockaddr_in address;
+    int opt = 1;
+    
+    // Creating socket file descriptor
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
+        perror("server socket");
+        exit(EXIT_FAILURE);
+    }
+    
+    // Forcefully attaching socket to the port 8080
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
+        perror("setsockopt");
+        exit(EXIT_FAILURE);
+    }
+    
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(port);
+
+    // Bind the socket to the address
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) == -1) {
+        perror("bind failed");
+        exit(EXIT_FAILURE);
+    }
+    
+    // Start listening for the clients, here process will go in sleep mode and will wait for the incoming connection
+    if (listen(server_fd, 10) == -1) {
+        perror("listen");
+        exit(EXIT_FAILURE);
+    }
+
+    return server_fd;
+}
+
+int TCP_client(int server_fd){
+    sockaddr address;
+    socklen_t addrlen = sizeof(address);
+    int client_fd = accept(server_fd, &address, &addrlen);
+    if(client_fd == -1){
+        perror("client socket");
+        exit(EXIT_FAILURE);
+    }
+    return client_fd;
+}
+
+int main(int argc, char *argv[])
+{
+    if(argc != 2){
+        fprintf(stderr, "follow the format: ./[program] [port].\n");
+        return 1;
+    }
+    int server_fd = TCP_server(atoi(argv[1]));
+    char *cmd = NULL;
+    size_t len = 0;
+    int null_fd = CREATE_NULL();
+    for(;;){
+        current_line = -1;
+        client_exit = false;
+        int client_fd = TCP_client(server_fd);
+        dup2(client_fd, STDOUT_FILENO);
+        dup2(client_fd, STDERR_FILENO);
+        dup2(client_fd, STDIN_FILENO);
+        close(client_fd);
+        fprintf(stdout, "%% ");
+        setenv("PATH", "bin:.", true);
+        while (fflush(stdout), fflush(stderr), getline(&cmd, &len, stdin) > 0) {
+            char *back = cmd + strlen(cmd) - 1;
+            while(*back == '\r' || *back == '\n')
+                *(back--) = 0;
+            single_cmd(cmd);
+            if(client_exit){
+                dup2(null_fd, STDOUT_FILENO);
+                dup2(null_fd, STDERR_FILENO);
+                dup2(null_fd, STDIN_FILENO);
+                break;
+            }
+            fprintf(stdout, "%% ");
+        }
     }
     return 0;
 }
