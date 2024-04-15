@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <queue>
 #include <unordered_map>
+#include <set>
 #include <vector>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -26,6 +27,31 @@ pid_t fork_with_retry()
     return pid;
 }
 #define fork() (lastpid = fork_with_retry())
+
+extern char **environ;
+class user_state{
+public:
+    unordered_map<int, pii> numbered_pipes;
+    unordered_map<string, string> environs;
+    user_state(){
+        for(char **env = environ; *env; ++env) {
+            string s = *env;
+            int sp = s.find('=');
+            string key = s.substr(0, sp);
+            string value = s.substr(sp);
+            environs[key] = value;
+        }
+        environs["PATH"] = "bin:.";
+    }
+    ~user_state(){
+        for(auto np: numbered_pipes){
+            close(np.second.first);
+            close(np.second.second);
+        }
+    }
+};
+
+user_state *current_user;
 
 #define FORK_AND_PIPE(statement_with_exit)       \
     do {                                         \
@@ -85,17 +111,17 @@ pid_t fork_with_retry()
         switch (follow[0]) {                                           \
         case '#': {                                                    \
             int target_line = atoi(follow + 1) + current_line;         \
-            if (!numbered_pipes.count(target_line)) {                  \
+            if (!current_user->numbered_pipes.count(target_line)) {                  \
                 int pipefd[2];                                         \
                 if (pipe(pipefd) == -1) {                              \
                     perror("pipe()");                                  \
                     exit(EXIT_FAILURE);                                \
                 }                                                      \
-                numbered_pipes[target_line].first = pipefd[0];         \
-                numbered_pipes[target_line].second = pipefd[1];        \
+                current_user->numbered_pipes[target_line].first = pipefd[0];         \
+                current_user->numbered_pipes[target_line].second = pipefd[1];        \
             }                                                          \
             FORK_NO_PIPE(statement_with_exit,                          \
-                         numbered_pipes[target_line].second);          \
+                         current_user->numbered_pipes[target_line].second);          \
             single_cmd(cmd);                                           \
             return;                                                    \
         }                                                              \
@@ -123,7 +149,8 @@ pid_t fork_with_retry()
 
 void exec(vector<char *> &argv)
 {
-    char *paths = getenv("PATH");
+    string _paths = current_user->environs["PATH"];
+    char *paths = &_paths[0];
     string exefile;
     while (*paths) {
         exefile = envtok(paths);
@@ -140,7 +167,6 @@ void exec(vector<char *> &argv)
 }
 
 int current_line;
-unordered_map<int, pii> numbered_pipes;
 bool client_exit;
 void single_cmd(char *cmd)
 {
@@ -150,11 +176,11 @@ void single_cmd(char *cmd)
     int lastfd = -1;
     pid_t lastpid = -1;
 
-    if (numbered_pipes.count(current_line)) {
-        pii pipefd = numbered_pipes[current_line];
+    if (current_user->numbered_pipes.count(current_line)) {
+        pii pipefd = current_user->numbered_pipes[current_line];
         lastfd = pipefd.first;
         close(pipefd.second);
-        numbered_pipes.erase(current_line);
+        current_user->numbered_pipes.erase(current_line);
     }
 
     while (*cmd) {
@@ -187,11 +213,10 @@ void single_cmd(char *cmd)
                 fprintf(stderr, "Usage: printenv [var].\n");
                 return;
             }
-            char *value = getenv(argv[1]);
-            if (value) {
-                puts(value);
+            if (!current_user->environs.count(argv[1]))
                 return;
-            }
+            char *value = &current_user->environs[argv[1]][0];
+            puts(value);
             return;
         }
         if (!strcmp(argv[0], "setenv")) {
@@ -199,7 +224,7 @@ void single_cmd(char *cmd)
                 fprintf(stderr, "Usage: setenv [var] [value].\n");
                 return;
             }
-            setenv(argv[1], argv[2], true);
+            current_user->environs[argv[1]] = argv[2];
             return;
         }
         FORK(exec(argv));
@@ -254,6 +279,7 @@ int TCP_client(int server_fd){
     return client_fd;
 }
 
+int client_fd;
 int main(int argc, char *argv[])
 {
     if(argc != 2){
@@ -265,15 +291,15 @@ int main(int argc, char *argv[])
     size_t len = 0;
     int null_fd = CREATE_NULL();
     for(;;){
-        current_line = -1;
-        client_exit = false;
-        int client_fd = TCP_client(server_fd);
+        client_fd = TCP_client(server_fd);
         dup2(client_fd, STDOUT_FILENO);
         dup2(client_fd, STDERR_FILENO);
         dup2(client_fd, STDIN_FILENO);
         close(client_fd);
+        current_line = -1;
+        client_exit = false;
+        current_user = new user_state();
         fprintf(stdout, "%% ");
-        setenv("PATH", "bin:.", true);
         while (fflush(stdout), fflush(stderr), getline(&cmd, &len, stdin) > 0) {
             char *back = cmd + strlen(cmd) - 1;
             while(*back == '\r' || *back == '\n')
