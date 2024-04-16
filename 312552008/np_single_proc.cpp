@@ -1,6 +1,7 @@
 #include "common.h"
 
 bool client_exit;
+unordered_map<int, user_state *> users;  // mapping fd to user state
 void single_cmd(char *cmd)
 {
     if (!*cmd)
@@ -19,9 +20,113 @@ void single_cmd(char *cmd)
     while (*cmd) {
         // parse first (process)
         vector<char *> argv;
-        do
+        argv.push_back(cmdtok(cmd));
+        if (!argv[0])
+            return;
+        if (!strcmp(argv[0], "exit")) {
+            client_exit = true;
+            return;
+        }
+        if (!strcmp(argv[0], "printenv")) {
             argv.push_back(cmdtok(cmd));
-        while (*cmd && *cmd != '|' && *cmd != '>' && *cmd != '!');
+            if (!argv[0] || !current_user->environs.count(argv[1]))
+                return;
+            char *value = &current_user->environs[argv[1]][0];
+            dprintf(current_user->connection.fd, "%s\n", value);
+            return;
+        }
+        if (!strcmp(argv[0], "setenv")) {
+            argv.push_back(cmdtok(cmd));
+            argv.push_back(cmdtok(cmd));
+            if (!argv[1] || !argv[2]) {
+                dprintf(current_user->connection.fd,
+                        "Usage: setenv [var] [value].\n");
+                return;
+            }
+            current_user->environs[argv[1]] = argv[2];
+            return;
+        }
+        if (!strcmp(argv[0], "who")) {
+            vector<user_state *> user_list;
+            for (auto kv : users) {
+                user_list.push_back(kv.second);
+            }
+            sort(user_list.begin(), user_list.end(),
+                 [](const user_state *a, const user_state *b) {
+                     return a->id < b->id;
+                 });
+            dprintf(current_user->connection.fd,
+                    "<ID>\t<nickname>\t<IP:port>\t<indicate me>\n");
+            for (auto user : user_list) {
+                dprintf(current_user->connection.fd, "%d\t%s\t%s:%d\t",
+                        user->id, user->name.c_str(),
+                        user->connection.ip.c_str(), user->connection.port);
+                if (current_user->id == user->id)
+                    dprintf(current_user->connection.fd, "<-me\n");
+                else
+                    dprintf(current_user->connection.fd, "\n");
+            }
+            return;
+        }
+        if (!strcmp(argv[0], "name")) {
+            argv.push_back(cmdtok(cmd));
+            if (!argv[1]) {
+                dprintf(current_user->connection.fd, "Usage: name [name].\n");
+                return;
+            }
+            for (auto kv : users) {
+                if (!strcmp(kv.second->name.c_str(), argv[1])) {
+                    dprintf(current_user->connection.fd,
+                            "*** User '%s' already exists. ***\n", argv[1]);
+                    return;
+                }
+            }
+            current_user->name = argv[1];
+            for (auto kv : users) {
+                dprintf(kv.first, "*** User from %s:%d is named '%s'. ***\n",
+                        current_user->connection.ip.c_str(),
+                        current_user->connection.port, argv[1]);
+            }
+            return;
+        }
+        if (!strcmp(argv[0], "tell")) {
+            argv.push_back(cmdtok(cmd));
+            int who = atoi(argv[1]);
+            for (auto kv : users) {
+                if (kv.second->id == who) {
+                    dprintf(kv.first, "*** %s told you ***: %s\n",
+                            current_user->name.c_str(), cmd);
+                    return;
+                }
+            }
+            dprintf(current_user->connection.fd,
+                    " *** Error: user #%d does not exist yet. ***\n", who);
+            return;
+        }
+        if (!strcmp(argv[0], "tell")) {
+            argv.push_back(cmdtok(cmd));
+            int who = atoi(argv[1]);
+            for (auto kv : users) {
+                if (kv.second->id == who) {
+                    dprintf(kv.first, "*** %s told you ***: %s\n",
+                            current_user->name.c_str(), cmd);
+                    return;
+                }
+            }
+            dprintf(current_user->connection.fd,
+                    "*** Error: user #%d does not exist yet. ***\n", who);
+            return;
+        }
+        if (!strcmp(argv[0], "yell")) {
+            for (auto kv : users) {
+                dprintf(kv.first, "*** %s  yelled ***:  %s\n",
+                        current_user->name.c_str(), cmd);
+            }
+            return;
+        }
+
+        while (*cmd && *cmd != '|' && *cmd != '>' && *cmd != '!')
+            argv.push_back(cmdtok(cmd));
         argv.push_back(NULL);
 
         // parse follow (|, >, |#, \0)
@@ -35,38 +140,11 @@ void single_cmd(char *cmd)
         if (follow[0] == '|' && follow[1])
             follow[0] = '#';  // for numbered pipe
 
-        if (!argv[0])
-            return;
-        if (!strcmp(argv[0], "exit")) {
-            client_exit = true;
-            return;
-        }
-        if (!strcmp(argv[0], "printenv")) {
-            if (argv.size() != 3) {
-                dprintf(current_user->connection.fd,
-                        "Usage: printenv [var].\n");
-                return;
-            }
-            if (!current_user->environs.count(argv[1]))
-                return;
-            char *value = &current_user->environs[argv[1]][0];
-            dprintf(current_user->connection.fd, "%s\n", value);
-            return;
-        }
-        if (!strcmp(argv[0], "setenv")) {
-            if (argv.size() != 4) {
-                dprintf(current_user->connection.fd,
-                        "Usage: setenv [var] [value].\n");
-                return;
-            }
-            current_user->environs[argv[1]] = argv[2];
-            return;
-        }
+
         FORK(exec(argv));
     }
 }
 
-unordered_map<int, user_state *> users;  // mapping fd to user state
 int main(int argc, char *argv[])
 {
     if (argc != 2) {
@@ -124,20 +202,26 @@ int main(int argc, char *argv[])
             return 1;
         }
         client_exit = false;
-        if (dgetline(&cmd, &len, current_user->connection.fd) < 0) {
-            delete users[current_user->connection.fd];
-            users.erase(current_user->connection.fd);
-            continue;
-        }
-        char *back = cmd + strlen(cmd) - 1;
+        char *back;
+        if (dgetline(&cmd, &len, current_user->connection.fd) < 0)
+            goto on_client_exit;
+        back = cmd + strlen(cmd) - 1;
         while (*back == '\r' || *back == '\n')
             *(back--) = 0;
         single_cmd(cmd);
-        if (client_exit) {
-            delete users[current_user->connection.fd];
-            users.erase(current_user->connection.fd);
-        } else
-            dprintf(current_user->connection.fd, "%% ");
+        if (client_exit)
+            goto on_client_exit;
+        dprintf(current_user->connection.fd, "%% ");
+        continue;
+    on_client_exit:
+        users.erase(current_user->connection.fd);
+        for (auto kv : users) {
+            if (kv.first == current_user->connection.fd)
+                continue;
+            dprintf(kv.first, "*** User '%s' left. ***\n",
+                    current_user->name.c_str());
+        }
+        delete current_user;
     }
     return 0;
 }
