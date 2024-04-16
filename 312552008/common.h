@@ -22,6 +22,7 @@ using namespace std;
 #define cmdtok(cmd) strtok_r(cmd, " ", &cmd)
 #define envtok(var) strtok_r(var, ":", &var)
 #define CREATE_NULL() open("/dev/null", O_RDWR)
+
 #define dprintf(fd, ...)          \
     do {                          \
         dprintf(fd, __VA_ARGS__); \
@@ -46,6 +47,12 @@ ssize_t dgetline(char **line, size_t *len, int fd)
     return ret;
 }
 
+#define perror(name)        \
+    do {                    \
+        perror(name);       \
+        exit(EXIT_FAILURE); \
+    } while (0)
+
 extern char **environ;
 int next_id = 1;
 set<int> recycled_ids;
@@ -65,10 +72,8 @@ public:
     {
         sockaddr_in address;
         socklen_t addrlen = sizeof(address);
-        if ((fd = accept(server_fd, (sockaddr *) &address, &addrlen)) == -1) {
-            perror("accept");
-            exit(EXIT_FAILURE);
-        }
+        if ((fd = accept(server_fd, (sockaddr *) &address, &addrlen)) == -1)
+            perror("accept()");
 
         char _ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &(address.sin_addr), _ip, INET_ADDRSTRLEN);
@@ -121,14 +126,11 @@ user_state *current_user;
 #define FORK_AND_PIPE(statement_with_exit)                        \
     do {                                                          \
         int _pipefd[2];                                           \
-        if (pipe(_pipefd) == -1) {                                \
+        if (pipe(_pipefd) == -1)                                  \
             perror("pipe()");                                     \
-            exit(EXIT_FAILURE);                                   \
-        }                                                         \
         switch (fork()) {                                         \
         case -1:                                                  \
             perror("fork()");                                     \
-            exit(EXIT_FAILURE);                                   \
         case 0:                                                   \
             close(_pipefd[0]);                                    \
             if (lastfd != -1) {                                   \
@@ -156,7 +158,6 @@ user_state *current_user;
         switch (fork()) {                                         \
         case -1:                                                  \
             perror("fork()");                                     \
-            exit(EXIT_FAILURE);                                   \
         case 0:                                                   \
             if (lastfd != -1) {                                   \
                 dup2(lastfd, STDIN_FILENO);                       \
@@ -175,41 +176,38 @@ user_state *current_user;
         }                                                         \
     } while (0)
 
-#define FORK(statement_with_exit)                                             \
-    do {                                                                      \
-        switch (follow[0]) {                                                  \
-        case '#': {                                                           \
-            int target_line = atoi(follow + 1) + current_user->current_line;  \
-            if (!current_user->numbered_pipes.count(target_line)) {           \
-                int pipefd[2];                                                \
-                if (pipe(pipefd) == -1) {                                     \
-                    perror("pipe()");                                         \
-                    exit(EXIT_FAILURE);                                       \
-                }                                                             \
-                current_user->numbered_pipes[target_line].first = pipefd[0];  \
-                current_user->numbered_pipes[target_line].second = pipefd[1]; \
-            }                                                                 \
-            FORK_NO_PIPE(statement_with_exit,                                 \
-                         current_user->numbered_pipes[target_line].second);   \
-            single_cmd(cmd);                                                  \
-            return;                                                           \
-        }                                                                     \
-        case '\0':                                                            \
-            FORK_NO_PIPE(statement_with_exit, current_user->connection.fd);   \
-            waitpid(lastpid, NULL, 0);                                        \
-            break;                                                            \
-        case '|':                                                             \
-            FORK_AND_PIPE(statement_with_exit);                               \
-            break;                                                            \
-        case '>': {                                                           \
-            int filefd =                                                      \
-                open(cmdtok(cmd), O_WRONLY | O_CREAT | O_TRUNC, 0644);        \
-            FORK_NO_PIPE(statement_with_exit, filefd);                        \
-            close(filefd);                                                    \
-            waitpid(lastpid, NULL, 0);                                        \
-            return;                                                           \
-        }                                                                     \
-        }                                                                     \
+#define FORK(statement_with_exit)                                            \
+    do {                                                                     \
+        switch (follow[0]) {                                                 \
+        case '#': {                                                          \
+            int target_line = atoi(follow + 1) + current_user->current_line; \
+            if (!current_user->numbered_pipes.count(target_line)) {          \
+                pii pipefd;                                                  \
+                if (pipe((int *) &pipefd) == -1)                             \
+                    perror("pipe()");                                        \
+                current_user->numbered_pipes[target_line] = pipefd;          \
+            }                                                                \
+            FORK_NO_PIPE(statement_with_exit,                                \
+                         current_user->numbered_pipes[target_line].second);  \
+            single_cmd(cmd);                                                 \
+            return;                                                          \
+        }                                                                    \
+        case '\0':                                                           \
+            FORK_NO_PIPE(statement_with_exit, current_user->connection.fd);  \
+            waitpid(lastpid, NULL, 0);                                       \
+            break;                                                           \
+        case '|':                                                            \
+            FORK_AND_PIPE(statement_with_exit);                              \
+            break;                                                           \
+        case '>': {                                                          \
+            int filefd =                                                     \
+                open(cmdtok(cmd), O_WRONLY | O_CREAT | O_TRUNC, 0644);       \
+            FORK_NO_PIPE(statement_with_exit, filefd);                       \
+            close(filefd);                                                   \
+            waitpid(lastpid, NULL, 0);                                       \
+            return;                                                          \
+        }                                                                    \
+        }                                                                    \
     } while (0)
 
 void exec(vector<char *> &argv)
@@ -238,34 +236,35 @@ int TCP_server(int port)
     int opt = 1;
 
     // Creating socket file descriptor
-    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
-        perror("socket");
-        exit(EXIT_FAILURE);
-    }
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1)
+        perror("socket()");
 
     // Forcefully attaching socket to the port 8080
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt,
-                   sizeof(opt))) {
-        perror("setsockopt");
-        exit(EXIT_FAILURE);
-    }
+                   sizeof(opt)))
+        perror("setsockopt()");
 
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(port);
 
     // Bind the socket to the address
-    if (bind(server_fd, (struct sockaddr *) &address, sizeof(address)) == -1) {
-        perror("bind failed");
-        exit(EXIT_FAILURE);
-    }
+    if (bind(server_fd, (struct sockaddr *) &address, sizeof(address)) == -1)
+        perror("bind()");
 
     // Start listening for the clients, here process will go in sleep mode and
     // will wait for the incoming connection
-    if (listen(server_fd, 10) == -1) {
-        perror("listen");
-        exit(EXIT_FAILURE);
-    }
+    if (listen(server_fd, 10) == -1)
+        perror("listen()");
 
     return server_fd;
 }
+
+class pii_hash
+{
+public:
+    size_t operator()(const pii &p) const
+    {
+        return ((size_t) p.first << 32) | p.second;
+    }
+};
