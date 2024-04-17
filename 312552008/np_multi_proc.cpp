@@ -1,57 +1,80 @@
+#include <sys/mman.h>
+
 #include "common.h"
 
-unordered_map<pii, int, pii_hash> user_pipes;  // mapping user pair to pipe
-unordered_map<int, user_state *> users;        // mapping fd to user state
+#define kill_func(pid) kill(pid, SIGUSR1);
+enum { ON_MESSAGE };
+
+typedef struct {
+    user_info_t uinfos[10000];
+    int next_uid;
+    char message[100000];
+} shared_memory_t;
+
+shared_memory_t *shared;
+
+shared_memory_t *create_sm()
+{
+    shared_memory_t *sm = (shared_memory_t *) mmap(
+        NULL, sizeof(shared_memory_t), PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (!sm)
+        perror("mmap()");
+    sm->next_uid = 1;
+    return sm;
+}
+
+void remove_sm(shared_memory_t *sm)
+{
+    if (munmap(sm, sizeof(int)) == -1)
+        perror("munmap()");
+}
+
+int get_uid()
+{
+    for (int uid = 1; uid < shared->next_uid; ++uid)
+        if (!shared->uinfos[uid].id) {
+            shared->uinfos[uid].id = uid;
+            return uid;
+        }
+    shared->uinfos[shared->next_uid].id = shared->next_uid;
+    return shared->next_uid++;
+}
+
+user_state *create_user_state(int server_fd)
+{
+    user_info_t uinf;
+    user_state *u = new user_state(server_fd, &uinf);
+    uinf.id = get_uid();
+    u->info = shared->uinfos + uinf.id;
+    *u->info = uinf;
+    return u;
+}
 
 void clear_user_state(user_state *user)
 {
-    vector<pii> removing;
-    for (auto kv : user_pipes) {
-        pii k = kv.first;
-        if (k.first == user->id || k.second == user->id)
-            removing.push_back(k);
-    }
-    for (pii k : removing)
-        user_pipes.erase(k);
-    users.erase(user->connection.fd);
-    for (auto kv : users)
-        dprintf(kv.first, "*** User '%s' left. ***\n", user->name.c_str());
+    user->info->id = 0;
+    sprintf(shared->message, "*** User '%s' left. ***\n", user->info->name);
+    for_uinfo (u, shared->uinfos, shared->next_uid)
+        kill_func(u->pid);
 
     delete user;
+}
+
+void func_handler(int sig)
+{
+    if (sig == SIGUSR1) {
+        dprintf(current_user->info->fd, "%s", shared->message);
+    }
 }
 
 bool client_exit;
 
 int fd_user_in(int id_user_in, const char *cmd)
 {
-    user_state *user_in = NULL;
-    for (auto kv : users) {
-        if (kv.second->id == id_user_in) {
-            user_in = kv.second;
-            break;
-        }
-    }
-    if (!user_in) {
-        dprintf(current_user->connection.fd,
-                "*** Error: user #%d does not exist yet. ***\n", id_user_in);
-        return CREATE_NULL();
-    }
-    pii key = {id_user_in, current_user->id};
-    if (!user_pipes.count(key)) {
-        dprintf(current_user->connection.fd,
-                "*** Error: the pipe #%d->#%d does not exist yet. ***\n",
-                key.first, key.second);
-        return CREATE_NULL();
-    }
-    for (auto kv : users)
-        dprintf(kv.second->connection.fd,
-                "*** %s (#%d) just received from %s (#%d) by '%s' ***\n",
-                current_user->name.c_str(), current_user->id,
-                user_in->name.c_str(), user_in->id, cmd);
-    int pipe0 = user_pipes[key];
-    user_pipes.erase(key);
-    return pipe0;
+    return CREATE_NULL();
 }
+
 void single_cmd(char *cmd)
 {
     if (!*cmd)
@@ -83,14 +106,14 @@ void single_cmd(char *cmd)
             if (!argv[0] || !current_user->environs.count(argv[1]))
                 return;
             char *value = &current_user->environs[argv[1]][0];
-            dprintf(current_user->connection.fd, "%s\n", value);
+            dprintf(current_user->info->fd, "%s\n", value);
             return;
         }
         if (!strcmp(argv[0], "setenv")) {
             argv.push_back(cmdtok(cmd));
             argv.push_back(cmdtok(cmd));
             if (!argv[1] || !argv[2]) {
-                dprintf(current_user->connection.fd,
+                dprintf(current_user->info->fd,
                         "Usage: setenv [var] [value].\n");
                 return;
             }
@@ -98,81 +121,54 @@ void single_cmd(char *cmd)
             return;
         }
         if (!strcmp(argv[0], "who")) {
-            vector<user_state *> user_list;
-            for (auto kv : users) {
-                user_list.push_back(kv.second);
-            }
-            sort(user_list.begin(), user_list.end(),
-                 [](const user_state *a, const user_state *b) {
-                     return a->id < b->id;
-                 });
-            dprintf(current_user->connection.fd,
+            dprintf(current_user->info->fd,
                     "<ID>\t<nickname>\t<IP:port>\t<indicate me>\n");
-            for (auto user : user_list) {
-                dprintf(current_user->connection.fd, "%d\t%s\t%s:%d\t",
-                        user->id, user->name.c_str(),
-                        user->connection.ip.c_str(), user->connection.port);
-                if (current_user->id == user->id)
-                    dprintf(current_user->connection.fd, "<-me\n");
+            for_uinfo (u, shared->uinfos, shared->next_uid) {
+                dprintf(current_user->info->fd, "%d\t%s\t%s:%d\t", u->id,
+                        u->name, u->ip, u->port);
+                if (current_user->info->id == u->id)
+                    dprintf(current_user->info->fd, "<-me\n");
                 else
-                    dprintf(current_user->connection.fd, "\n");
+                    dprintf(current_user->info->fd, "\n");
             }
             return;
         }
         if (!strcmp(argv[0], "name")) {
             argv.push_back(cmdtok(cmd));
             if (!argv[1]) {
-                dprintf(current_user->connection.fd, "Usage: name [name].\n");
+                dprintf(current_user->info->fd, "Usage: name [name].\n");
                 return;
             }
-            for (auto kv : users) {
-                if (!strcmp(kv.second->name.c_str(), argv[1])) {
-                    dprintf(current_user->connection.fd,
+            for_uinfo (u, shared->uinfos, shared->next_uid)
+                if (!strcmp(u->name, argv[1])) {
+                    dprintf(current_user->info->fd,
                             "*** User '%s' already exists. ***\n", argv[1]);
                     return;
                 }
-            }
-            current_user->name = argv[1];
-            for (auto kv : users) {
-                dprintf(kv.first, "*** User from %s:%d is named '%s'. ***\n",
-                        current_user->connection.ip.c_str(),
-                        current_user->connection.port, argv[1]);
-            }
+            strcpy(current_user->info->name, argv[1]);
+            sprintf(shared->message, "*** User from %s:%d is named '%s'. ***\n",
+                    current_user->info->ip, current_user->info->port, argv[1]);
+            for_uinfo (u, shared->uinfos, shared->next_uid)
+                kill_func(u->pid);
             return;
         }
         if (!strcmp(argv[0], "tell")) {
             argv.push_back(cmdtok(cmd));
             int who = atoi(argv[1]);
-            for (auto kv : users) {
-                if (kv.second->id == who) {
-                    dprintf(kv.first, "*** %s told you ***: %s\n",
-                            current_user->name.c_str(), cmd);
-                    return;
-                }
-            }
-            dprintf(current_user->connection.fd,
-                    " *** Error: user #%d does not exist yet. ***\n", who);
-            return;
-        }
-        if (!strcmp(argv[0], "tell")) {
-            argv.push_back(cmdtok(cmd));
-            int who = atoi(argv[1]);
-            for (auto kv : users) {
-                if (kv.second->id == who) {
-                    dprintf(kv.first, "*** %s told you ***: %s\n",
-                            current_user->name.c_str(), cmd);
-                    return;
-                }
-            }
-            dprintf(current_user->connection.fd,
-                    "*** Error: user #%d does not exist yet. ***\n", who);
+            if (shared->uinfos[who].id) {
+                sprintf(shared->message, "*** %s told you ***: %s\n",
+                        current_user->info->name, cmd);
+                kill_func(shared->uinfos[who].pid);
+            } else
+                dprintf(current_user->info->fd,
+                        " *** Error: user #%d does not exist yet. ***\n", who);
             return;
         }
         if (!strcmp(argv[0], "yell")) {
-            for (auto kv : users) {
-                dprintf(kv.first, "*** %s  yelled ***:  %s\n",
-                        current_user->name.c_str(), cmd);
-            }
+            sprintf(shared->message, "*** %s  yelled ***:  %s\n",
+                    current_user->info->name, cmd);
+            for_uinfo (u, shared->uinfos, shared->next_uid)
+                kill_func(u->pid);
             return;
         }
 
@@ -181,7 +177,7 @@ void single_cmd(char *cmd)
         argv.push_back(NULL);
 
         // parse operators (|, >, |#, \0, <, >u)
-        int nextfd = current_user->connection.fd;
+        int nextfd = current_user->info->fd;
         bool close_nextfd = false;
         bool error_pipe = false;
         int id_user_in = -1;
@@ -240,41 +236,7 @@ void single_cmd(char *cmd)
                 lastfd = fd_user_in(id_user_in, cmd_record.c_str());
             while (id_user_out != -1) {  // if
                 close_nextfd = true;
-                user_state *user_out = NULL;
-                for (auto kv : users) {
-                    if (kv.second->id == id_user_out) {
-                        user_out = kv.second;
-                        break;
-                    }
-                }
-                if (!user_out) {
-                    dprintf(current_user->connection.fd,
-                            "*** Error: user #%d does not exist yet. ***\n",
-                            id_user_out);
-                    nextfd = CREATE_NULL();
-                    break;
-                }
-                pii key = {current_user->id, id_user_out};
-                if (user_pipes.count(key)) {
-                    dprintf(
-                        current_user->connection.fd,
-                        "*** Error: the pipe #%d->#%d already exists. ***\n",
-                        key.first, key.second);
-                    nextfd = CREATE_NULL();
-                    break;
-                }
-                pii pipefd;
-                if (pipe((int *) &pipefd) == -1)
-                    perror("pipe()");
-                user_pipes[key] = pipefd.first;
-                nextfd = pipefd.second;
-                close_nextfd = true;
-                for (auto kv : users)
-                    dprintf(kv.second->connection.fd,
-                            "*** %s (#%d) just piped '%s' to %s (#%d) ***\n",
-                            current_user->name.c_str(), current_user->id,
-                            cmd_record.c_str(), user_out->name.c_str(),
-                            user_out->id);
+                nextfd = CREATE_NULL();
                 break;
             }
             FORK_NO_PIPE(exec(argv), nextfd);
@@ -286,73 +248,61 @@ void single_cmd(char *cmd)
     }
 }
 
+void child()
+{
+    signal(SIGUSR1, func_handler);
+    current_user->info->pid = getpid();
+    char *cmd = NULL;
+    size_t len = 0;
+    client_exit = false;
+    dprintf(current_user->info->fd,
+            "****************************************\n");
+    dprintf(current_user->info->fd,
+            "** Welcome to the information server. **\n");
+    dprintf(current_user->info->fd,
+            "****************************************\n");
+    sprintf(shared->message, "*** User '%s' entered from %s:%d. ***\n",
+            current_user->info->name, current_user->info->ip,
+            current_user->info->port);
+    for (user_info_t *u = shared->uinfos + 1;
+         u != shared->uinfos + shared->next_uid; ++u)
+        kill_func(u->pid);
+
+    dprintf(current_user->info->fd, "%% ");
+    while (dgetline(&cmd, &len, current_user->info->fd) > 0) {
+        char *back = cmd + strlen(cmd) - 1;
+        while (*back == '\r' || *back == '\n')
+            *(back--) = 0;
+        single_cmd(cmd);
+        if (client_exit)
+            break;
+        dprintf(current_user->info->fd, "%% ");
+    }
+    clear_user_state(current_user);
+    exit(EXIT_SUCCESS);
+}
+
 int main(int argc, char *argv[])
 {
     if (argc != 2) {
         dprintf(STDERR_FILENO, "follow the format: ./[program] [port].\n");
         return 1;
     }
+    shared = create_sm();
     int server_fd = TCP_server(atoi(argv[1]));
-    char *cmd = NULL;
-    size_t len = 0;
-
     for (;;) {
-        fd_set fdset;
-        int maxfd = server_fd;
-        FD_ZERO(&fdset);
-        FD_SET(server_fd, &fdset);
-        for (auto kv : users) {
-            FD_SET(kv.first, &fdset);
-            maxfd = max(maxfd, kv.first);
-        }
+        current_user = create_user_state(server_fd);
 
-        if (select(maxfd + 1, &fdset, NULL, NULL, NULL) <= 0)
-            perror("select()");
-
-        if (FD_ISSET(server_fd, &fdset)) {
-            current_user = new user_state();
-            current_user->connection.from(server_fd);
-            users[current_user->connection.fd] = current_user;
-            dprintf(current_user->connection.fd,
-                    "****************************************\n");
-            dprintf(current_user->connection.fd,
-                    "** Welcome to the information server. **\n");
-            dprintf(current_user->connection.fd,
-                    "****************************************\n");
-            for (auto kv : users)
-                dprintf(kv.first, "*** User '%s' entered from %s:%d. ***\n",
-                        current_user->name.c_str(),
-                        current_user->connection.ip.c_str(),
-                        current_user->connection.port);
-            dprintf(current_user->connection.fd, "%% ");
+        pid_t lastpid;
+        switch (fork()) {
+        case 0:
+            child();
+        case -1:
+            perror("fork()");
+        default:
+            delete current_user;
             continue;
         }
-
-        current_user = NULL;
-        for (auto kv : users) {
-            if (FD_ISSET(kv.first, &fdset)) {
-                current_user = kv.second;
-                current_user->connection.fd = kv.first;
-                break;
-            }
-        }
-        if (!current_user)
-            perror("select()");
-        client_exit = false;
-        char *back;
-        if (dgetline(&cmd, &len, current_user->connection.fd) < 0)
-            goto on_client_exit;
-        back = cmd + strlen(cmd) - 1;
-        while (*back == '\r' || *back == '\n')
-            *(back--) = 0;
-        dprintf(STDOUT_FILENO, "%d: %s\n", current_user->id, cmd);
-        single_cmd(cmd);
-        if (client_exit)
-            goto on_client_exit;
-        dprintf(current_user->connection.fd, "%% ");
-        continue;
-    on_client_exit:
-        clear_user_state(current_user);
     }
     return 0;
 }

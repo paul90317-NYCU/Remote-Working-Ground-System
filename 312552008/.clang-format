@@ -13,3 +13,6 @@ UseTab: Never
 IndentWidth: 4
 BreakBeforeBraces: Linux
 AccessModifierOffset: -4
+ForEachMacros:
+  - for_uinfo
+  - for_uinfo_empyt

@@ -17,7 +17,7 @@
             return;                                                          \
         }                                                                    \
         case '\0':                                                           \
-            FORK_NO_PIPE(statement_with_exit, current_user->connection.fd);  \
+            FORK_NO_PIPE(statement_with_exit, current_user->info->fd);       \
             waitpid(lastpid, NULL, 0);                                       \
             break;                                                           \
         case '|':                                                            \
@@ -77,19 +77,18 @@ void single_cmd(char *cmd)
         }
         if (!strcmp(argv[0], "printenv")) {
             if (argv.size() != 3) {
-                dprintf(current_user->connection.fd,
-                        "Usage: printenv [var].\n");
+                dprintf(current_user->info->fd, "Usage: printenv [var].\n");
                 return;
             }
             if (!current_user->environs.count(argv[1]))
                 return;
             char *value = &current_user->environs[argv[1]][0];
-            dprintf(current_user->connection.fd, "%s\n", value);
+            dprintf(current_user->info->fd, "%s\n", value);
             return;
         }
         if (!strcmp(argv[0], "setenv")) {
             if (argv.size() != 4) {
-                dprintf(current_user->connection.fd,
+                dprintf(current_user->info->fd,
                         "Usage: setenv [var] [value].\n");
                 return;
             }
@@ -110,18 +109,18 @@ int main(int argc, char *argv[])
     char *cmd = NULL;
     size_t len = 0;
     for (;;) {
-        current_user = new user_state();
-        current_user->connection.from(server_fd);
+        user_info_t uinfo;
+        current_user = new user_state(server_fd, &uinfo);
         client_exit = false;
-        dprintf(current_user->connection.fd, "%% ");
-        while (dgetline(&cmd, &len, current_user->connection.fd) > 0) {
+        dprintf(current_user->info->fd, "%% ");
+        while (dgetline(&cmd, &len, current_user->info->fd) > 0) {
             char *back = cmd + strlen(cmd) - 1;
             while (*back == '\r' || *back == '\n')
                 *(back--) = 0;
             single_cmd(cmd);
             if (client_exit)
                 break;
-            dprintf(current_user->connection.fd, "%% ");
+            dprintf(current_user->info->fd, "%% ");
         }
         delete current_user;
     }
