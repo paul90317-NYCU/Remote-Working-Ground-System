@@ -68,6 +68,32 @@ int fd_user_in(int id_user_in, const char *cmd)
     return pipe0;
 }
 
+int fd_user_out(int id_user_out, const char *cmd)
+{
+    user_info_t *uout_info = uinfos + id_user_out;
+    if (!uout_info->id) {
+        dprintf(current_user->info->fd,
+                "*** Error: user #%d does not exist yet. ***\n", id_user_out);
+        return CREATE_NULL();
+    }
+    pii key = {current_user->info->id, id_user_out};
+    if (user_pipes.count(key)) {
+        dprintf(current_user->info->fd,
+                "*** Error: the pipe #%d->#%d already exists. ***\n", key.first,
+                key.second);
+        return CREATE_NULL();
+    }
+    pii pipefd;
+    if (pipe((int *) &pipefd) == -1)
+        perror("pipe()");
+    user_pipes[key] = pipefd.first;
+    for_uinfo (u, uinfos, next_uid)
+        dprintf(u->fd, "*** %s (#%d) just piped '%s' to %s (#%d) ***\n",
+                current_user->info->name, current_user->info->id, cmd,
+                uout_info->name, uout_info->id);
+    return pipefd.second;
+}
+
 void single_cmd(char *cmd)
 {
     if (!*cmd)
@@ -225,36 +251,9 @@ void single_cmd(char *cmd)
         if (!*cmd) {
             if (id_user_in != -1)
                 lastfd = fd_user_in(id_user_in, cmd_record.c_str());
-            while (id_user_out != -1) {  // if
+            if (id_user_out != -1) {  // if
                 close_nextfd = true;
-                user_info_t *uout_info = uinfos + id_user_out;
-                if (!uout_info->id) {
-                    dprintf(current_user->info->fd,
-                            "*** Error: user #%d does not exist yet. ***\n",
-                            id_user_out);
-                    nextfd = CREATE_NULL();
-                    break;
-                }
-                pii key = {current_user->info->id, id_user_out};
-                if (user_pipes.count(key)) {
-                    dprintf(
-                        current_user->info->fd,
-                        "*** Error: the pipe #%d->#%d already exists. ***\n",
-                        key.first, key.second);
-                    nextfd = CREATE_NULL();
-                    break;
-                }
-                pii pipefd;
-                if (pipe((int *) &pipefd) == -1)
-                    perror("pipe()");
-                user_pipes[key] = pipefd.first;
-                nextfd = pipefd.second;
-                for_uinfo (u, uinfos, next_uid)
-                    dprintf(u->fd,
-                            "*** %s (#%d) just piped '%s' to %s (#%d) ***\n",
-                            current_user->info->name, current_user->info->id,
-                            cmd_record.c_str(), uout_info->name, uout_info->id);
-                break;
+                nextfd = fd_user_out(id_user_out, cmd_record.c_str());
             }
             FORK_NO_PIPE(exec(argv), nextfd);
             if (close_nextfd)

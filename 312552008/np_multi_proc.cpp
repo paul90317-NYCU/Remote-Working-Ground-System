@@ -1,13 +1,24 @@
 #include <sys/mman.h>
+#include <sys/stat.h>
 
 #include "common.h"
 
-#define kill_func(pid) kill(pid, SIGUSR1);
-enum { ON_MESSAGE };
+enum { ON_MESSAGE, ON_FIFO_ACCEPT, ON_FIFO_RECVEIVE };
+#define kill(pid, _event)           \
+    do {                            \
+        if (_event == ON_MESSAGE) { \
+            kill(pid, SIGUSR1);     \
+            break;                  \
+        }                           \
+        shared->event = _event;     \
+        kill(pid, SIGUSR2);         \
+    } while (0)
 
 typedef struct {
+    int event;
     user_info_t uinfos[10000];
     int next_uid;
+    int fifo_sender_id;
     char message[100000];
 } shared_memory_t;
 
@@ -56,15 +67,39 @@ void clear_user_state(user_state *user)
     user->info->id = 0;
     sprintf(shared->message, "*** User '%s' left. ***\n", user->info->name);
     for_uinfo (u, shared->uinfos, shared->next_uid)
-        kill_func(u->pid);
+        kill(u->pid, ON_MESSAGE);
 
     delete user;
 }
 
-void func_handler(int sig)
+unordered_map<int, int> fifos;  // id to fd
+unordered_set<int> fifos_exist;
+
+void my_sig_hander(int sig)
 {
-    if (sig == SIGUSR1) {
+    switch (sig) {
+    case SIGUSR1:
         dprintf(current_user->info->fd, "%s", shared->message);
+        return;
+    case SIGUSR2:
+        switch (shared->event) {
+        case ON_FIFO_RECVEIVE: {
+            string_t key;
+            sprintf(key, "./user_pipe/%d_%d", shared->fifo_sender_id,
+                    current_user->info->id);
+            fifos[shared->fifo_sender_id] = open(key, O_RDONLY);
+            dprintf(current_user->info->fd, "%s", shared->message);
+        } break;
+        case ON_FIFO_ACCEPT:
+            fifos_exist.erase(shared->fifo_sender_id);
+            dprintf(current_user->info->fd, "%s", shared->message);
+            break;
+        default:
+            perror("my_sig_hander()");
+        }
+        return;
+    default:
+        perror("my_sig_hander()");
     }
 }
 
@@ -72,7 +107,80 @@ bool client_exit;
 
 int fd_user_in(int id_user_in, const char *cmd)
 {
-    return CREATE_NULL();
+    user_info_t *uin_info = shared->uinfos + id_user_in;
+    if (!uin_info->id) {
+        dprintf(current_user->info->fd,
+                "*** Error: user #%d does not exist yet. ***\n", id_user_in);
+        return CREATE_NULL();
+    }
+
+    if (!fifos.count(id_user_in)) {
+        dprintf(current_user->info->fd,
+                "*** Error: the pipe #%d->#%d does not exist yet. ***\n",
+                id_user_in, current_user->info->id);
+        return CREATE_NULL();
+    }
+
+    shared->fifo_sender_id = current_user->info->id;
+    sprintf(shared->message,
+            "*** %s (#%d) just received from %s (#%d) by '%s' ***\n",
+            current_user->info->name, current_user->info->id, uin_info->name,
+            uin_info->id, cmd);
+
+    for_uinfo (u, shared->uinfos, shared->next_uid) {
+        if (u->id != uin_info->id)
+            kill(u->pid, ON_MESSAGE);
+        else
+            kill(uin_info->pid, ON_FIFO_ACCEPT);
+    }
+
+
+    int fd = fifos[id_user_in];
+    fifos.erase(id_user_in);
+    return fd;
+}
+
+int fd_user_out(int id_user_out, const char *cmd)
+{
+    user_info_t *uout_info = shared->uinfos + id_user_out;
+    if (!uout_info->id) {
+        dprintf(current_user->info->fd,
+                "*** Error: user #%d does not exist yet. ***\n", id_user_out);
+        return CREATE_NULL();
+    }
+    string_t key;
+    sprintf(key, "./user_pipe/%d_%d", current_user->info->id, id_user_out);
+
+    if (fifos_exist.count(id_user_out)) {
+        dprintf(current_user->info->fd,
+                "*** Error: the pipe #%d->#%d already exists. ***\n",
+                current_user->info->id, id_user_out);
+        return CREATE_NULL();
+    }
+    fifos_exist.insert(id_user_out);
+    if (mkfifo(key, 0777) == -1) {
+        if (unlink(key) == -1)
+            perror("unlink()");
+        if (mkfifo(key, 0777) == -1)
+            perror("mkfifo()");
+    }
+
+    shared->fifo_sender_id = current_user->info->id;
+    sprintf(shared->message, "*** %s (#%d) just piped '%s' to %s (#%d) ***\n",
+            current_user->info->name, current_user->info->id, cmd,
+            uout_info->name, uout_info->id);
+
+    for_uinfo (u, shared->uinfos, shared->next_uid) {
+        if (u->id != uout_info->id) {
+            kill(u->pid, ON_MESSAGE);
+        } else
+            kill(uout_info->pid, ON_FIFO_RECVEIVE);
+    }
+
+    int fd = open(key, O_WRONLY);
+    if (fd <= 0)
+        perror("open()");
+    return fd;
 }
 
 void single_cmd(char *cmd)
@@ -149,7 +257,7 @@ void single_cmd(char *cmd)
             sprintf(shared->message, "*** User from %s:%d is named '%s'. ***\n",
                     current_user->info->ip, current_user->info->port, argv[1]);
             for_uinfo (u, shared->uinfos, shared->next_uid)
-                kill_func(u->pid);
+                kill(u->pid, ON_MESSAGE);
             return;
         }
         if (!strcmp(argv[0], "tell")) {
@@ -158,7 +266,7 @@ void single_cmd(char *cmd)
             if (shared->uinfos[who].id) {
                 sprintf(shared->message, "*** %s told you ***: %s\n",
                         current_user->info->name, cmd);
-                kill_func(shared->uinfos[who].pid);
+                kill(shared->uinfos[who].pid, ON_MESSAGE);
             } else
                 dprintf(current_user->info->fd,
                         " *** Error: user #%d does not exist yet. ***\n", who);
@@ -168,7 +276,7 @@ void single_cmd(char *cmd)
             sprintf(shared->message, "*** %s  yelled ***:  %s\n",
                     current_user->info->name, cmd);
             for_uinfo (u, shared->uinfos, shared->next_uid)
-                kill_func(u->pid);
+                kill(u->pid, ON_MESSAGE);
             return;
         }
 
@@ -234,11 +342,11 @@ void single_cmd(char *cmd)
         if (!*cmd) {
             if (id_user_in != -1)
                 lastfd = fd_user_in(id_user_in, cmd_record.c_str());
-            while (id_user_out != -1) {  // if
+            if (id_user_out != -1) {
                 close_nextfd = true;
-                nextfd = CREATE_NULL();
-                break;
+                nextfd = fd_user_out(id_user_out, cmd_record.c_str());
             }
+
             FORK_NO_PIPE(exec(argv), nextfd);
             if (close_nextfd)
                 close(nextfd);
@@ -250,7 +358,8 @@ void single_cmd(char *cmd)
 
 void child()
 {
-    signal(SIGUSR1, func_handler);
+    signal(SIGUSR1, my_sig_hander);
+    signal(SIGUSR2, my_sig_hander);
     current_user->info->pid = getpid();
     char *cmd = NULL;
     size_t len = 0;
@@ -264,9 +373,8 @@ void child()
     sprintf(shared->message, "*** User '%s' entered from %s:%d. ***\n",
             current_user->info->name, current_user->info->ip,
             current_user->info->port);
-    for (user_info_t *u = shared->uinfos + 1;
-         u != shared->uinfos + shared->next_uid; ++u)
-        kill_func(u->pid);
+    for_uinfo (u, shared->uinfos, shared->next_uid)
+        kill(u->pid, ON_MESSAGE);
 
     dprintf(current_user->info->fd, "%% ");
     while (dgetline(&cmd, &len, current_user->info->fd) > 0) {
@@ -288,6 +396,7 @@ int main(int argc, char *argv[])
         dprintf(STDERR_FILENO, "follow the format: ./[program] [port].\n");
         return 1;
     }
+
     shared = create_sm();
     int server_fd = TCP_server(atoi(argv[1]));
     for (;;) {

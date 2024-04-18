@@ -55,7 +55,7 @@ ssize_t dgetline(char **line, size_t *len, int fd)
     } while (0)
 
 extern char **environ;
-typedef char string_t[21];
+typedef char string_t[51];
 
 typedef struct {
     pid_t pid;
