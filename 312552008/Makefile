@@ -10,4 +10,7 @@ np_single_proc: np_single_proc.cpp
 	$(CC) $< $(CPPFLAGS) -o $@ -g
 
 clean:
-	@rm -rf np_simple
+	@rm -rf np_simple np_single_proc
+
+format:
+	clang-format -i *.cpp *.h --style=file
