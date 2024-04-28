@@ -225,3 +225,10 @@ public:
 #define for_uinfo_empty(u, uinfos, next_uid)                       \
     for (user_info_t *u = uinfos + 1; u != uinfos + next_uid; ++u) \
         if (!u->id)
+
+
+void sigchld_handler(int signum)
+{
+    while (waitpid(-1, NULL, WNOHANG) > 0)
+        ;
+}

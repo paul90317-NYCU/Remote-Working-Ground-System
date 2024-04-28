@@ -271,22 +271,23 @@ int main(int argc, char *argv[])
         dprintf(STDERR_FILENO, "follow the format: ./[program] [port].\n");
         return 1;
     }
+    signal(SIGCHLD, sigchld_handler);
     int server_fd = TCP_server(atoi(argv[1]));
     char *cmd = NULL;
     size_t len = 0;
 
     for (;;) {
         fd_set fdset;
-        int maxfd = server_fd;
-        FD_ZERO(&fdset);
-        FD_SET(server_fd, &fdset);
-        for (auto kv : users) {
-            FD_SET(kv.first, &fdset);
-            maxfd = max(maxfd, kv.first);
-        }
-
-        if (select(maxfd + 1, &fdset, NULL, NULL, NULL) <= 0)
-            perror("select()");
+        int maxfd;
+        do {
+            maxfd = server_fd;
+            FD_ZERO(&fdset);
+            FD_SET(server_fd, &fdset);
+            for (auto kv : users) {
+                FD_SET(kv.first, &fdset);
+                maxfd = max(maxfd, kv.first);
+            }
+        } while (select(maxfd + 1, &fdset, NULL, NULL, NULL) == -1);
 
         if (FD_ISSET(server_fd, &fdset)) {
             current_user = create_user_state(server_fd);

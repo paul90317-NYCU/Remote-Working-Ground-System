@@ -105,6 +105,7 @@ int main(int argc, char *argv[])
         fprintf(stderr, "follow the format: ./[program] [port].\n");
         return 1;
     }
+    signal(SIGCHLD, sigchld_handler);
     int server_fd = TCP_server(atoi(argv[1]));
     char *cmd = NULL;
     size_t len = 0;

@@ -4,15 +4,6 @@
 #include "common.h"
 
 enum { ON_FIFO_ACCEPT, ON_FIFO_RECVEIVE };
-/*#define kill(pid, _event)           \
-    do {                            \
-        if (_event == ON_MESSAGE) { \
-            kill(pid, SIGUSR1);     \
-            break;                  \
-        }                           \
-        shared->event = _event;     \
-        kill(pid, SIGUSR2);         \
-    } while (0)*/
 
 typedef struct {
     int event;
@@ -102,6 +93,14 @@ void my_sig_hander(int sig)
     default:
         perror("my_sig_hander()");
     }
+}
+
+void sigint_handler(int signum)
+{
+    kill(0, SIGINT);
+    while (waitpid(0, NULL, 0) > 0)
+        ;
+    exit(0);
 }
 
 bool client_exit;
@@ -360,6 +359,8 @@ void child()
 {
     signal(SIGUSR1, my_sig_hander);
     signal(SIGUSR2, my_sig_hander);
+    signal(SIGINT, SIG_DFL);
+    signal(SIGCHLD, SIG_DFL);
     current_user->info->pid = getpid();
     char *cmd = NULL;
     size_t len = 0;
@@ -396,7 +397,8 @@ int main(int argc, char *argv[])
         dprintf(STDERR_FILENO, "follow the format: ./[program] [port].\n");
         return 1;
     }
-
+    signal(SIGINT, sigint_handler);
+    signal(SIGCHLD, sigchld_handler);
     shared = create_sm();
     int server_fd = TCP_server(atoi(argv[1]));
     for (;;) {
