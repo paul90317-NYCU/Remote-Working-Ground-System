@@ -1,5 +1,39 @@
 #include "common.h"
 
+#define FORK(statement_with_exit)                                            \
+    do {                                                                     \
+        switch (follow[0]) {                                                 \
+        case '#': {                                                          \
+            int target_line = atoi(follow + 1) + current_user->current_line; \
+            if (!current_user->numbered_pipes.count(target_line)) {          \
+                pii pipefd;                                                  \
+                if (pipe((int *) &pipefd) == -1)                             \
+                    perror("pipe()");                                        \
+                current_user->numbered_pipes[target_line] = pipefd;          \
+            }                                                                \
+            FORK_NO_PIPE(statement_with_exit,                                \
+                         current_user->numbered_pipes[target_line].second);  \
+            single_cmd(cmd);                                                 \
+            return;                                                          \
+        }                                                                    \
+        case '\0':                                                           \
+            FORK_NO_PIPE(statement_with_exit, current_user->connection.fd);  \
+            waitpid(lastpid, NULL, 0);                                       \
+            break;                                                           \
+        case '|':                                                            \
+            FORK_AND_PIPE(statement_with_exit);                              \
+            break;                                                           \
+        case '>': {                                                          \
+            int filefd =                                                     \
+                open(cmdtok(cmd), O_WRONLY | O_CREAT | O_TRUNC, 0644);       \
+            FORK_NO_PIPE(statement_with_exit, filefd);                       \
+            close(filefd);                                                   \
+            waitpid(lastpid, NULL, 0);                                       \
+            return;                                                          \
+        }                                                                    \
+        }                                                                    \
+    } while (0)
+
 bool client_exit;
 void single_cmd(char *cmd)
 {
