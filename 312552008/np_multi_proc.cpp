@@ -399,7 +399,7 @@ void child()
         char *back = cmd + strlen(cmd) - 1;
         while (*back == '\r' || *back == '\n')
             *(back--) = 0;
-        dprintf(STDOUT_FILENO, "%d: %s\n", current_user->info->id, cmd);
+        // dprintf(STDOUT_FILENO, "%d: %s\n", current_user->info->id, cmd);
         single_cmd(cmd);
         if (client_exit)
             break;
