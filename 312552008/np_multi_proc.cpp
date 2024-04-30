@@ -1,3 +1,5 @@
+#include <semaphore.h>
+#include <stdarg.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 
@@ -10,11 +12,40 @@ typedef struct {
     user_info_t uinfos[10000];
     int next_uid;
     int curr_fifoid;
-    int fifo_sender_id;
+    int fifo_user_id;
+    int fifo_target;
     char message[100000];
+    sem_t barrier;
 } shared_memory_t;
 
 shared_memory_t *shared;
+
+class broadcast
+{
+private:
+    int n;
+
+public:
+    broadcast(int sig, const char *format, ...)
+    {
+        va_list args;
+        va_start(args, format);
+        vsprintf(shared->message, format, args);
+        va_end(args);
+
+        sem_init(&shared->barrier, 1, 0);
+        n = 0;
+        for_uinfo (u, shared->uinfos, shared->next_uid) {
+            ++n;
+            kill(u->pid, sig);
+        }
+    }
+    void wait()
+    {
+        while (n--)
+            sem_wait(&shared->barrier);
+    }
+};
 
 shared_memory_t *create_sm()
 {
@@ -58,10 +89,7 @@ user_state *create_user_state(int server_fd)
 void clear_user_state(user_state *user)
 {
     user->info->id = 0;
-    sprintf(shared->message, "*** User '%s' left. ***\n", user->info->name);
-    for_uinfo (u, shared->uinfos, shared->next_uid)
-        kill(u->pid, SIGUSR1);
-
+    broadcast(SIGUSR1, "*** User '%s' left. ***\n", user->info->name).wait();
     delete user;
 }
 
@@ -71,24 +99,24 @@ unordered_set<int> fifos_exist;
 void my_sig_hander(int sig)
 {
     switch (sig) {
-    case SIGUSR1:
-        dprintf(current_user->info->fd, "%s", shared->message);
-        return;
     case SIGUSR2:
-        switch (shared->event) {
-        case ON_FIFO_RECVEIVE: {
-            string_t key;
-            sprintf(key, "./user_pipe/%d", shared->curr_fifoid);
-            fifos[shared->fifo_sender_id] = open(key, O_RDONLY);
-            dprintf(current_user->info->fd, "%s", shared->message);
-        } break;
-        case ON_FIFO_ACCEPT:
-            fifos_exist.erase(shared->fifo_sender_id);
-            dprintf(current_user->info->fd, "%s", shared->message);
-            break;
-        default:
-            perror("my_sig_hander()");
-        }
+        if (current_user->info->id == shared->fifo_target)
+            switch (shared->event) {
+            case ON_FIFO_RECVEIVE: {
+                string_t key;
+                sprintf(key, "./user_pipe/%d", shared->curr_fifoid);
+                fifos[shared->fifo_user_id] = open(key, O_RDONLY);
+                break;
+            }
+            case ON_FIFO_ACCEPT:
+                fifos_exist.erase(shared->fifo_user_id);
+                break;
+            default:
+                perror("my_sig_hander()");
+            }
+    case SIGUSR1:
+        sem_post(&shared->barrier);
+        dprintf(current_user->info->fd, "%s", shared->message);
         return;
     default:
         perror("my_sig_hander()");
@@ -100,6 +128,7 @@ void sigint_handler(int signum)
     kill(0, SIGINT);
     while (waitpid(0, NULL, 0) > 0)
         ;
+    remove_sm(shared);
     exit(0);
 }
 
@@ -121,21 +150,13 @@ int fd_user_in(int id_user_in, const char *cmd)
         return CREATE_NULL();
     }
 
-    shared->fifo_sender_id = current_user->info->id;
-    sprintf(shared->message,
-            "*** %s (#%d) just received from %s (#%d) by '%s' ***\n",
-            current_user->info->name, current_user->info->id, uin_info->name,
-            uin_info->id, cmd);
-
+    shared->fifo_user_id = current_user->info->id;
     shared->event = ON_FIFO_ACCEPT;
-    for_uinfo (u, shared->uinfos, shared->next_uid) {
-        if (u->id != uin_info->id)
-            kill(u->pid, SIGUSR1);
-        else
-            kill(uin_info->pid, SIGUSR2);
-    }
-
-
+    shared->fifo_target = uin_info->id;
+    broadcast(SIGUSR2, "*** %s (#%d) just received from %s (#%d) by '%s' ***\n",
+              current_user->info->name, current_user->info->id, uin_info->name,
+              uin_info->id, cmd)
+        .wait();
 
     int fd = fifos[id_user_in];
     fifos.erase(id_user_in);
@@ -163,22 +184,20 @@ int fd_user_out(int id_user_out, const char *cmd)
     fifos_exist.insert(id_user_out);
     mkfifo(key, 0777);
 
-    shared->fifo_sender_id = current_user->info->id;
-    sprintf(shared->message, "*** %s (#%d) just piped '%s' to %s (#%d) ***\n",
-            current_user->info->name, current_user->info->id, cmd,
-            uout_info->name, uout_info->id);
-
+    shared->fifo_user_id = current_user->info->id;
     shared->event = ON_FIFO_RECVEIVE;
-    for_uinfo (u, shared->uinfos, shared->next_uid) {
-        if (u->id != uout_info->id)
-            kill(u->pid, SIGUSR1);
-        else
-            kill(uout_info->pid, SIGUSR2);
-    }
+    shared->fifo_target = uout_info->id;
+    broadcast broadcast_promise(
+        SIGUSR2, "*** %s (#%d) just piped '%s' to %s (#%d) ***\n",
+        current_user->info->name, current_user->info->id, cmd, uout_info->name,
+        uout_info->id);
 
     int fd = open(key, O_WRONLY);
     if (fd <= 0)
         perror("open()");
+
+    broadcast_promise.wait();
+
     return fd;
 }
 
@@ -253,10 +272,9 @@ void single_cmd(char *cmd)
                     return;
                 }
             strcpy(current_user->info->name, argv[1]);
-            sprintf(shared->message, "*** User from %s:%d is named '%s'. ***\n",
-                    current_user->info->ip, current_user->info->port, argv[1]);
-            for_uinfo (u, shared->uinfos, shared->next_uid)
-                kill(u->pid, SIGUSR1);
+            broadcast(SIGUSR1, "*** User from %s:%d is named '%s'. ***\n",
+                      current_user->info->ip, current_user->info->port, argv[1])
+                .wait();
             return;
         }
         if (!strcmp(argv[0], "tell")) {
@@ -266,16 +284,16 @@ void single_cmd(char *cmd)
                 sprintf(shared->message, "*** %s told you ***: %s\n",
                         current_user->info->name, cmd);
                 kill(shared->uinfos[who].pid, SIGUSR1);
+                sem_wait(&shared->barrier);
             } else
                 dprintf(current_user->info->fd,
                         " *** Error: user #%d does not exist yet. ***\n", who);
             return;
         }
         if (!strcmp(argv[0], "yell")) {
-            sprintf(shared->message, "*** %s  yelled ***:  %s\n",
-                    current_user->info->name, cmd);
-            for_uinfo (u, shared->uinfos, shared->next_uid)
-                kill(u->pid, SIGUSR1);
+            broadcast(SIGUSR1, "*** %s  yelled ***:  %s\n",
+                      current_user->info->name, cmd)
+                .wait();
             return;
         }
 
@@ -371,17 +389,17 @@ void child()
             "** Welcome to the information server. **\n");
     dprintf(current_user->info->fd,
             "****************************************\n");
-    sprintf(shared->message, "*** User '%s' entered from %s:%d. ***\n",
-            current_user->info->name, current_user->info->ip,
-            current_user->info->port);
-    for_uinfo (u, shared->uinfos, shared->next_uid)
-        kill(u->pid, SIGUSR1);
+    broadcast(SIGUSR1, "*** User '%s' entered from %s:%d. ***\n",
+              current_user->info->name, current_user->info->ip,
+              current_user->info->port)
+        .wait();
 
     dprintf(current_user->info->fd, "%% ");
     while (dgetline(&cmd, &len, current_user->info->fd) > 0) {
         char *back = cmd + strlen(cmd) - 1;
         while (*back == '\r' || *back == '\n')
             *(back--) = 0;
+        dprintf(STDOUT_FILENO, "%d: %s\n", current_user->info->id, cmd);
         single_cmd(cmd);
         if (client_exit)
             break;
